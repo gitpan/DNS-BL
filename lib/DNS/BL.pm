@@ -72,7 +72,7 @@ use constant DNSBL_EOTHER	=> 16;
 
 use constant ERR_MSG => "Must issue a 'connect' first";
 
-our $VERSION = '0.01';
+our $VERSION = '0.03';
 $VERSION = eval $VERSION;  # see L<perlmodstyle>
 
 # Preloaded methods go here.
@@ -334,6 +334,11 @@ Original version; created by h2xs 1.22
 =item 0.01
 
 First RC
+
+=item 0.02
+
+Added an index to db connection method. This improves performance. Minor
+changes to other components. Added regression testing for IO commands.
 
 =back
 

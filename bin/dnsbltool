@@ -52,6 +52,7 @@ else
 	{
 	    next;
 	}
+	print "$line\n" if $opt_v;
 	my ($c, $x) = $bl->parse($line);
 	die "[$c] " . $x . "\n"	if $c != &DNS::BL::DNSBL_OK;
 	$line = '';

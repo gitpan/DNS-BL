@@ -55,11 +55,16 @@ usually C<DNS::BL::cmds::connect>. B<args> are key - value pairs
 specifying different parameters as described below. Unknown parameters
 are reported as errors. The complete calling sequence is as
 
-  connect db file "filename"
+  connect db file "filename" [mode bulk]
 
 Where "filename" refers to the DB file where data is to be found. If
 the file does not exist, it will be created (provided that permissions
 allow).
+
+If "mode bulk" is indicated, arrangements are made to tie() to the
+database once. This makes the operation slightly faster, but increases
+the chance of collision when concurrent access to the backing store is
+performed.
 
 This class will be C<use>d and then, its C<execute()> method invoked
 following the same protocol outlined in L<DNS::BL>. Prior C<connect()>
@@ -73,7 +78,7 @@ sub execute
     my $command	= shift;	# Expect "db"
     my %args	= @_;
 
-    my @known 	= qw/file/;
+    my @known 	= qw/file mode/;
 
     unless ($command eq 'db')
     {
@@ -101,8 +106,29 @@ sub execute
     }
 
     # Store the passed data
-
     $args{_class} = __PACKAGE__;
+
+    if (exists $args{mode})
+    {
+	if ($args{mode} eq 'bulk')
+	{
+	    my %db = ();
+	    unless (tie %db, 'MLDBM', $args{file}, O_CREAT|O_RDWR, 0640)
+	    {
+		return wantarray ? 
+		    (&DNS::BL::DNSBL_ECONNECT(), 
+		     "Cannot tie to file '$args{file}'")
+		    : &DNS::BL::DNSBL_ECONNECT();
+	    }
+	    $args{_db} = \%db;
+	}
+	else
+	{
+	    return wantarray ? (&DNS::BL::DNSBL_ESYNTAX(), 
+				"Missing or wrong name for 'connect db mode'")
+		: &DNS::BL::DNSBL_ESYNTAX();
+	}
+    }
 
     $bl->set("_connect", \%args);
 
@@ -122,8 +148,9 @@ sub execute
 sub _portal
 {
     my $bl	= shift;	# Calling BL object
-    my $r	= shift;	# Ref to a hash to be tied
     my $data	= $bl->get('_connect');
+
+    my %r	= ();		# Placeholder for the DB
 
     unless ($data or $data->{_class} eq __PACKAGE__)
     {
@@ -133,16 +160,23 @@ sub _portal
 	    : &DNS::BL::DNSBL_ESYNTAX();
     }
 
-    unless (tie %$r, 'MLDBM', $data->{file}, O_CREAT|O_RDWR, 0640)
+    if (exists $data->{_db})
     {
-	return wantarray ? 
-	    (&DNS::BL::DNSBL_ECONNECT(), 
-	     "Cannot tie to file '" . $data->{file} . "'")
-	    : &DNS::BL::DNSBL_ECONNECT();
+	return wantarray ? (&DNS::BL::DNSBL_OK, "DB tied", $data->{_db}) : 
+	    &DNS::BL::DNSBL_OK;
     }
-
-    return wantarray ? (&DNS::BL::DNSBL_OK, "DB tied") : 
-	&DNS::BL::DNSBL_OK;
+    else
+    {
+	unless (tie %r, 'MLDBM', $data->{file}, O_CREAT|O_RDWR, 0640)
+	{
+	    return wantarray ? 
+		(&DNS::BL::DNSBL_ECONNECT(), 
+		 "Cannot tie to file '" . $data->{file} . "'")
+		: &DNS::BL::DNSBL_ECONNECT();
+	}
+	return wantarray ? (&DNS::BL::DNSBL_OK, "DB tied", \%r) : 
+	    &DNS::BL::DNSBL_OK;
+    }
 }
 
 sub _write
@@ -150,11 +184,41 @@ sub _write
     my $bl	= shift;
     my $e	= shift;
 
-    my %db	= ();
-    my @r = _portal($bl, \%db);
+    my @r = _portal($bl);
     return wantarray ? @r : $r[0] if $r[0] != &DNS::BL::DNSBL_OK;
 
-    $db{$e->addr->network->cidr} = $e;
+    my $db = $r[2];
+
+    # The index update is only needed if no prior entry exists.
+    unless (exists $db->{$e->addr->network->cidr})
+    {
+	# Build the index until level - 1
+	if ($e->addr->masklen > 0)
+	{
+	    for my $m (0 .. $e->addr->masklen - 1)
+	    {
+		my $f = NetAddr::IP->new($e->addr->addr . "/$m")->network;
+		my @c = grep { $_->contains($e->addr) } $f->split($m + 1);
+		my $i = $db->{'index:' . $f} || [];
+		unless (grep { 'index:' . $c[0]->cidr eq $_ } @$i)
+		{
+		    push @$i, 'index:' . $c[0]->cidr;
+		    $db->{'index:' . $f} = $i;
+		}
+	    }
+	}
+
+	# Build the last index level
+	my $i = $db->{'index:' . $e->addr->network->cidr} || [];
+	unless (grep { 'index:' . $e->addr->network->cidr eq $_ } @$i)
+	{
+	    push @$i, 'node:' . $e->addr->network->cidr;
+	    $db->{'index:' . $e->addr->network->cidr} = $i;
+	}
+    }
+
+    # Store the actual entry in the hash
+    $db->{$e->addr->network->cidr} = $e;
 
     return wantarray ? (&DNS::BL::DNSBL_OK, "OK - Done") : 
 	&DNS::BL::DNSBL_OK;
@@ -165,19 +229,38 @@ sub _read
     my $bl	= shift;
     my $e	= shift;
 
-    my %db	= ();
-    my @r = _portal($bl, \%db);
+    my @r = _portal($bl);
     return wantarray ? @r : $r[0] if $r[0] != &DNS::BL::DNSBL_OK;
 
-    my $N = $e->addr;
-    my @ret = ();
+    my $db = $r[2];
 
-    for my $n (keys %db)
+    my @ret = ();
+    my $index = $db->{'index:' . $e->addr->network->cidr} || [];
+
+    # Use the index to find the entries that must be attached
+    while (@$index)
     {
-	my $ip = new NetAddr::IP $n;
-	next unless $ip;
-	push @ret, $db{$n} if $N->contains($ip);
+	my $l = shift @$index;
+#	print "_read: Index checking $l out of ", 0 + @$index, "\n";
+	if (substr($l, 0, 5) eq 'node:')
+	{
+	    my $ip = new NetAddr::IP substr($l, 5);
+#	    print "_read: Consider $ip\n";
+	    push @ret, $ip if $e->addr->contains($ip);
+	}
+	elsif (substr($l, 0, 6) eq 'index:')
+	{
+	    my $ip = new NetAddr::IP substr($l, 6);
+	    if ($e->addr->contains($ip))
+	    {
+		my $i = $db->{$l};
+		push @$index, @$i if $i;
+#		print "_read: Add $l to queue\n";
+	    }
+	}
     }
+    
+    @ret = grep { defined $_ } map { $db->{$_->network->cidr} } @ret;
 
     return (&DNS::BL::DNSBL_OK, scalar @ret . " entries found",
 	    @ret) if @ret;
@@ -189,19 +272,38 @@ sub _match
     my $bl	= shift;
     my $e	= shift;
 
-    my %db	= ();
-    my @r = _portal($bl, \%db);
+    my @r = _portal($bl);
     return wantarray ? @r : $r[0] if $r[0] != &DNS::BL::DNSBL_OK;
 
-    my $N = $e->addr;
-    my @ret = ();
+    my $db = $r[2];
 
-    for my $n (keys %db)
+    my @ret = ();
+    my $index = $db->{'index:' . NetAddr::IP->new('any')->network->cidr} || [];
+
+    # Use the index to find the entries that must be attached
+    while (@$index)
     {
-	my $ip = new NetAddr::IP $n;
-	next unless $ip;
-	push @ret, $db{$n} if $N->within($ip);
+	my $l = shift @$index;
+#	print "_match: Index checking $l out of ", 0 + @$index, "\n";
+	if (substr($l, 0, 5) eq 'node:')
+	{
+	    my $ip = new NetAddr::IP substr($l, 5);
+#	    print "_match: Consider $ip\n";
+	    push @ret, $ip if $e->addr->within($ip);
+	}
+	elsif (substr($l, 0, 6) eq 'index:')
+	{
+	    my $ip = new NetAddr::IP substr($l, 6);
+	    if ($e->addr->within($ip))
+	    {
+		my $i = $db->{$l};
+		push @$index, @$i if $i;
+#		print "_match: Add $l to queue\n";
+	    }
+	}
     }
+    
+    @ret = grep { defined $_ } map { $db->{$_->network->cidr} } @ret;
 
     return (&DNS::BL::DNSBL_OK, scalar @ret . " entries found",
 	    @ret) if @ret;
@@ -219,20 +321,88 @@ sub _delete
     my $bl	= shift;
     my $e	= shift;
 
-    my %db	= ();
-    my @r = _portal($bl, \%db);
+    my @r = _portal($bl);
     return wantarray ? @r : $r[0] if $r[0] != &DNS::BL::DNSBL_OK;
 
-    my $N = $e->addr;
+    my $db = $r[2];
     my $num = 0;
+    my @ret = ();
+    my $index = $db->{'index:' . $e->addr->network->cidr} || [];
 
-    for my $n (keys %db)
+    # Use the index to find which entries must be deleted
+    while (@$index)
     {
-	my $ip = new NetAddr::IP $n;
-	next unless $ip;
-	next unless $N->contains($ip);
-	delete $db{$n};
-	++$num;
+	my $l = shift @$index;
+#	print "_delete: Index checking $l out of ", 0 + @$index, "\n";
+	if (substr($l, 0, 5) eq 'node:')
+	{
+	    my $ip = new NetAddr::IP substr($l, 5);
+#	    print "_delete: Consider $ip\n";
+	    push @ret, $ip if $e->addr->contains($ip);
+	}
+	elsif (substr($l, 0, 6) eq 'index:')
+	{
+	    my $ip = new NetAddr::IP substr($l, 6);
+	    if ($e->addr->contains($ip))
+	    {
+		my $i = $db->{$l};
+		push @$index, @$i if $i;
+#		print "_delete: Add $l to queue\n";
+	    }
+	}
+    }
+
+    # Based on the hits, delete entries from the hash and from
+    # the cache
+    for my $n (@ret)
+    {
+#	print "_delete: deleting 'node:" . $n->network->cidr . "'\n";
+	delete $db->{$n->network->cidr};
+	++ $num;
+
+	for my $m (reverse 0 .. $n->masklen)
+	{
+	    my $k = 'index:' 
+		. NetAddr::IP->new($n->addr . "/$m")->network->cidr;
+#	    print "_delete: Check cache for $k\n";
+	    my $i = $db->{$k} || [];
+	    my @rem = ();
+
+	    push @rem, grep { substr($_, 0, 6) eq 'index:' 
+				  and exists $db->{$_} } @$i;
+
+	    push @rem,
+	    grep { $_ }
+	    map { $_->[1] if exists $db->{$_->[0]} }
+	    map { [ substr($_, 5), $_ ] }
+	    grep { substr($_, 0, 5) eq 'node:' } 
+	    @$i;
+
+#	    print "_delete: db $k -> [", join(',', @$i) || 'empty', "]\n";
+#	    print "_delete: rem $k -> [", join(',', @rem) || 'empty', "]\n";
+#	    print "_delete: comp=", ($#rem == $#$i), ", rem=", 
+#	    scalar @rem, ", i=", scalar @$i, "\n";
+#	    print "_delete: rem=", 
+#	    map { defined $_ ? $_ ? $_ : 'false' : 'undef' } @rem, "\n";
+#	    print "_delete: i=",
+#	    map { defined $_ ? $_ ? $_ : 'false' : 'undef' } @$i, "\n";
+
+	    if (@rem == @$i)
+	    {
+#		print "_delete: This node was unchanged - Skip the rest\n";
+		last;
+	    }
+	    elsif (@rem)
+	    {
+		$db->{$k} = \@rem;
+#		print "_delete: rebuild index node '$k'\n";
+	    }
+	    else
+	    {
+#		print "_delete: delete index node '$k'\n";
+		delete $db->{$k};
+	    }
+	}
     }
 
     if ($num)
@@ -291,6 +461,15 @@ None by default.
 =head1 HISTORY
 
 $Log: db.pm,v $
+Revision 1.5  2004/11/09 22:49:20  lem
+Return valid results even with slightly corrupt indexes
+
+Revision 1.4  2004/10/24 20:29:51  lem
+Added an index to speed up _read and _match
+
+Revision 1.3  2004/10/21 18:33:08  lem
+Added rudimentary import support + bulk mode
+
 Revision 1.2  2004/10/12 17:44:46  lem
 Updated docs. Added print with format
 
