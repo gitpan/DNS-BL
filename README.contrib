@@ -1,0 +1,10 @@
+The contrib directory in this distribution includes various tools
+that are useful. Currently, this includes:
+
+contrib/blmanager.cgi
+
+  A very simple CGI script that allows for the manipulation of DNSBLs
+  through a web interface. It is intended as the basis for your very
+  own and does not excercise all the features of DNS::BL. You must
+  edit it before testing.
+
